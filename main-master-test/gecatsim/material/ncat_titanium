@@ -1,0 +1,14 @@
+# Density source: NCAT software distribution
+# Material composition source: same as density
+
+# Elemental material: 
+# NCAT titanium
+
+# Number of elements:
+1
+
+# Density:
+4.530000
+
+# Atomic number(s) and corresponding mass fraction(s):
+22    1.000000    # titanium

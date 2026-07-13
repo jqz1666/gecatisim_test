@@ -1,0 +1,5 @@
+# Copyright 2024, GE Precision HealthCare. All rights reserved. See https://github.com/xcist/main/tree/master/license
+
+CSOURCES += \
+fm_gethostid.c \
+fm_getrandpid.c

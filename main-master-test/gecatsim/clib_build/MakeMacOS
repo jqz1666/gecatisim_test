@@ -1,0 +1,50 @@
+# Copyright 2024, GE Precision HealthCare. All rights reserved. See https://github.com/xcist/main/tree/master/license
+
+include ../MakeVariables_1
+include ../MakeVariables_2
+include ../MakeVariables_3
+
+CFLAGS = -fPIC -O3
+CXXFLAGS = -Wall -fPIC -O3
+
+LDFLAGS = -fPIC -lpthread -lstdc++
+
+all: libcatsim_macos.so
+
+p_nlog_inline.o: p_nlog_inline.c
+	#gcc -O0 -g -Wall -static -msse -masm=intel -fPIC -c p_nlog_inline.c
+    # For a Mac OS machine with the Intel chip
+	#/usr/local/opt/gcc/bin/gcc-14 -O0 -g -Wall -static -msse -fPIC -c p_nlog_inline.c
+	# For a Mac OS machine with the Apple M1/M2/M3/M4 chip, don't need the "-msse" flag.
+	/opt/homebrew/bin/gcc-15 -O0 -g -Wall -static -fPIC -c p_nlog_inline.c
+
+64bitLibrary = libcatsim_macos.so
+
+$(64bitLibrary): $(OBJECTS)
+	@echo ............................................
+	@echo .
+	@echo . Building system-specific library ...
+	@echo .
+	@echo .
+	$(CXX) $(CXXFLAGS) -stdlib=libc++ -std=c11 -o $(64bitLibrary) -shared $(OBJECTS) $(LDFLAGS)
+	mv libcatsim_macos.so ../../lib
+	@echo .
+	@echo .
+	@echo . Done building system-specific library.
+	@echo .
+	@echo ............................................
+
+clean:
+	@echo ............................................
+	@echo .
+	@echo . Cleaning ...
+	@echo .
+	@echo .
+	rm -f *.o
+	@echo .
+	@echo .
+	@echo . Done cleaning.
+	@echo .
+	@echo ............................................
+
+# DO NOT DELETE

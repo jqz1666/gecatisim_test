@@ -1,0 +1,19 @@
+# Molecular weights from https://www.nist.gov/pml/atomic-weights-and-isotopic-compositions-relative-atomic-masses.
+# Density source: NCAT software distribution
+# Material composition source: same as density
+
+# Material name:
+# NCAT adipose
+
+# Number of elements:
+5
+
+# Density:
+0.920000
+
+# Atomic number(s) and corresponding mass fraction(s):
+1    0.120120    # hydrogen
+6    0.640641    # carbon
+7    0.008008    # nitrogen
+8    0.229229    # oxygen
+15    0.002002    # phosphorus

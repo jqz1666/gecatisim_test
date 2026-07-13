@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="${SCRIPT_DIR}/src/voxelized_projector_cuda.cu"
+OUT_DIR="${SCRIPT_DIR}/../lib"
+OUT="${OUT_DIR}/libcatsim_voxel_projector_cuda.so"
+
+mkdir -p "${OUT_DIR}"
+
+if ! command -v nvcc >/dev/null 2>&1; then
+    echo "ERROR: nvcc was not found. Install CUDA Toolkit and ensure nvcc is on PATH." >&2
+    exit 1
+fi
+
+nvcc -O3 --use_fast_math -Xcompiler="-fPIC" -shared "${SRC}" -o "${OUT}"
+echo "Built ${OUT}"

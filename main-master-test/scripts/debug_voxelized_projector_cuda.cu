@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -78,12 +79,12 @@ int main(int argc, char **argv) {
     const int nx = 8;
     const int ny = 8;
     const int nz = 8;
-    const int volume_data_count = nx * ny * nz;
+    const int64_t volume_data_count = (int64_t)nx * ny * nz;
 
     float volume_data[volume_data_count];
     fill_volume(volume_data, nx, ny, nz);
 
-    int volume_offsets[n_materials + 1] = {0, volume_data_count};
+    int64_t volume_offsets[n_materials + 1] = {0, volume_data_count};
     int dims[n_materials * 3] = {nx, ny, nz};
     float volume_offsets_xyz[n_materials * 3] = {-0.5f * (nx - 1), -0.5f * (ny - 1), -0.5f * (nz - 1)};
     float voxel_size[n_materials * 3] = {1.0f, 1.0f, 1.0f};
@@ -93,7 +94,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nx * ny * 2; ++i) {
         xy_mask[i] = 1;
     }
-    int xy_mask_offsets[n_materials + 1] = {0, nx * ny * 2};
+    int64_t xy_mask_offsets[n_materials + 1] = {0, (int64_t)nx * ny * 2};
 
     float src_samples[n_sources * 3] = {0.0f, 80.0f, 0.0f};
     float src_weights[n_sources] = {1.0f};

@@ -6,11 +6,13 @@ __pycache__/
 *$py.class
 
 # Simulated data in examples
-examples/*.air
-examples/*.offset
-examples/*.scan
-examples/*.prep
-examples/*.recon
+.air
+.offset
+.raw
+.scan
+.prep
+.recon
+
 
 # Distribution / packaging
 .Python

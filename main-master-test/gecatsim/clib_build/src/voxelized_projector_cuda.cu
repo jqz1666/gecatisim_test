@@ -20,6 +20,157 @@ static const int CUDA_PROJECTOR_RUNTIME_ERROR = -4;
 
 #define MIN_CUDA(a, b) (((a) < (b)) ? (a) : (b))
 
+struct CudaPhantom_cache
+{
+    int valid;
+    int device_id;
+
+    const float *h_volume_data;
+    const int64_t *h_volume_offsets;
+    const int *h_dims;
+    const float *h_volume_offsets_xyz;
+    const float *h_voxel_size;
+    const float *h_mu;
+    const unsigned char *h_xy_mask;
+    const int64_t *h_xy_mask_offsets;
+
+    int n_materials;
+    int n_energy;
+    int64_t volume_data_count;
+    int64_t xy_mask_count;
+
+    float *d_volume_data;
+    int64_t *d_volume_offsets;
+    int *d_dims;
+    float *d_volume_offsets_xyz;
+    float *d_voxel_size;
+    float *d_mu;
+    unsigned char *d_xy_mask;
+    int64_t *d_xy_mask_offsets;
+};
+
+static CudaPhantom_cache g_cuda_phantom = {0};
+
+static void clear_phantom_cache()
+{
+    cudaFree(g_cuda_phantom.d_volume_data);
+    cudaFree(g_cuda_phantom.d_volume_offsets);
+    cudaFree(g_cuda_phantom.d_dims);
+    cudaFree(g_cuda_phantom.d_volume_offsets_xyz);
+    cudaFree(g_cuda_phantom.d_voxel_size);
+    cudaFree(g_cuda_phantom.d_mu);
+    cudaFree(g_cuda_phantom.d_xy_mask);
+    cudaFree(g_cuda_phantom.d_xy_mask_offsets);
+
+    memset(&g_cuda_phantom, 0, sizeof(g_cuda_phantom));
+}
+
+static int ensure_phantom_cache(
+    int device_id,
+    const float *volume_data,
+    const int64_t *volume_offsets,
+    const int *dims,
+    const float *volume_offsets_xyz,
+    const float *voxel_size,
+    const float *mu,
+    const unsigned char *xy_mask,
+    const int64_t *xy_mask_offsets,
+    int n_materials,
+    int n_energy,
+    int64_t volume_data_count,
+    int64_t xy_mask_count)
+{
+    if (g_cuda_phantom.valid &&
+        g_cuda_phantom.device_id == device_id &&
+        g_cuda_phantom.h_volume_data == volume_data &&
+        g_cuda_phantom.h_volume_offsets == volume_offsets &&
+        g_cuda_phantom.h_dims == dims &&
+        g_cuda_phantom.h_volume_offsets_xyz == volume_offsets_xyz &&
+        g_cuda_phantom.h_voxel_size == voxel_size &&
+        g_cuda_phantom.h_mu == mu &&
+        g_cuda_phantom.h_xy_mask == xy_mask &&
+        g_cuda_phantom.h_xy_mask_offsets == xy_mask_offsets &&
+        g_cuda_phantom.n_materials == n_materials &&
+        g_cuda_phantom.n_energy == n_energy &&
+        g_cuda_phantom.volume_data_count == volume_data_count &&
+        g_cuda_phantom.xy_mask_count == xy_mask_count)
+    {
+        return CUDA_PROJECTOR_SUCCESS;
+    }
+
+    clear_phantom_cache();
+
+    g_cuda_phantom.device_id = device_id;
+    g_cuda_phantom.h_volume_data = volume_data;
+    g_cuda_phantom.h_volume_offsets = volume_offsets;
+    g_cuda_phantom.h_dims = dims;
+    g_cuda_phantom.h_volume_offsets_xyz = volume_offsets_xyz;
+    g_cuda_phantom.h_voxel_size = voxel_size;
+    g_cuda_phantom.h_mu = mu;
+    g_cuda_phantom.h_xy_mask = xy_mask;
+    g_cuda_phantom.h_xy_mask_offsets = xy_mask_offsets;
+    g_cuda_phantom.n_materials = n_materials;
+    g_cuda_phantom.n_energy = n_energy;
+    g_cuda_phantom.volume_data_count = volume_data_count;
+    g_cuda_phantom.xy_mask_count = xy_mask_count;
+
+    size_t volume_bytes = (size_t)volume_data_count * sizeof(float);
+    size_t volume_offsets_bytes = (size_t)(n_materials + 1) * sizeof(int64_t);
+    size_t dims_bytes = (size_t)n_materials * 3 * sizeof(int);
+    size_t vector3_bytes = (size_t)n_materials * 3 * sizeof(float);
+    size_t mu_bytes = (size_t)n_energy * (size_t)n_materials * sizeof(float);
+    size_t xy_mask_bytes = (size_t)xy_mask_count * sizeof(unsigned char);
+
+    cudaError_t err = cudaSuccess;
+
+    err = cudaMalloc((void **)&g_cuda_phantom.d_volume_data, volume_bytes);
+    if (err == cudaSuccess)
+        err = cudaMalloc((void **)&g_cuda_phantom.d_volume_offsets, volume_offsets_bytes);
+    if (err == cudaSuccess)
+        err = cudaMalloc((void **)&g_cuda_phantom.d_dims, dims_bytes);
+    if (err == cudaSuccess)
+        err = cudaMalloc((void **)&g_cuda_phantom.d_volume_offsets_xyz, vector3_bytes);
+    if (err == cudaSuccess)
+        err = cudaMalloc((void **)&g_cuda_phantom.d_voxel_size, vector3_bytes);
+    if (err == cudaSuccess)
+        err = cudaMalloc((void **)&g_cuda_phantom.d_mu, mu_bytes);
+    if (err == cudaSuccess)
+        err = cudaMalloc((void **)&g_cuda_phantom.d_xy_mask, xy_mask_bytes);
+    if (err == cudaSuccess)
+        err = cudaMalloc((void **)&g_cuda_phantom.d_xy_mask_offsets, volume_offsets_bytes);
+
+    if (err != cudaSuccess)
+    {
+        clear_phantom_cache();
+        return CUDA_PROJECTOR_MEMORY_ERROR;
+    }
+
+    err = cudaMemcpy(g_cuda_phantom.d_volume_data, volume_data, volume_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(g_cuda_phantom.d_volume_offsets, volume_offsets, volume_offsets_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(g_cuda_phantom.d_dims, dims, dims_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(g_cuda_phantom.d_volume_offsets_xyz, volume_offsets_xyz, vector3_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(g_cuda_phantom.d_voxel_size, voxel_size, vector3_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(g_cuda_phantom.d_mu, mu, mu_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(g_cuda_phantom.d_xy_mask, xy_mask, xy_mask_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(g_cuda_phantom.d_xy_mask_offsets, xy_mask_offsets, volume_offsets_bytes, cudaMemcpyHostToDevice);
+
+    if (err != cudaSuccess)
+    {
+        clear_phantom_cache();
+        return CUDA_PROJECTOR_RUNTIME_ERROR;
+    }
+
+    g_cuda_phantom.valid = 1;
+    return CUDA_PROJECTOR_SUCCESS;
+}
+
 static int convert_modular_detector_compatible(
     float **xds,
     float **yds,
@@ -190,10 +341,13 @@ __global__ void prepare_dd3_geometry_kernel(
     float xoff = volume_offsets_xyz[mat_id * 3 + 0];
     float yoff = volume_offsets_xyz[mat_id * 3 + 1];
     float zoff = volume_offsets_xyz[mat_id * 3 + 2];
-    float x0 = src_samples[src_id * 3 + 0] - xoff;
-    float y0 = src_samples[src_id * 3 + 1] - yoff;
-    float z0 = src_samples[src_id * 3 + 2] - zoff;
+    float x0 = src_samples[src_id * 3 + 0];
+    float y0 = src_samples[src_id * 3 + 1];
+    float z0 = src_samples[src_id * 3 + 2];
     int vertical = fabsf(y0) >= fabsf(x0);
+    x0 -= xoff;
+    y0 -= yoff;
+    z0 -= zoff;
 
     float *task_detX = detX + (size_t)task * (size_t)(nrdetcols + 3);
     float *task_scales = scales + (size_t)task * (size_t)(nrdetcols + 2);
@@ -244,7 +398,7 @@ __device__ void dd3_project_row_device(
     float imgZstep,
     int nrplanes,
     const float *pImg,
-    int pImgBase,
+    int64_t pImgBase,
     int trans_rowstep,
     const float *detX,
     int increment,
@@ -281,14 +435,14 @@ __device__ void dd3_project_row_device(
         end_imgX_ind = MIN_CUDA(end_imgX_ind, nrcols);
     }
 
-    int pImgOffset = pImgBase;
+    int64_t pImgOffset = pImgBase;
     int view_col = 0;
     if (detX_0 > previousX)
     {
         start_imgX_ind = (int)((detX_0 - imgXStart) * inv_imgXstep - 1.0f);
         if (start_imgX_ind > 0)
         {
-            pImgOffset += start_imgX_ind * nrplanes * trans_rowstep;
+            pImgOffset += (int64_t)start_imgX_ind * nrplanes * trans_rowstep;
             colnr = start_imgX_ind;
             previousX = imgXStart + imgXstep * start_imgX_ind;
             imgX = previousX + imgXstep;
@@ -338,7 +492,7 @@ __device__ void dd3_project_row_device(
             float enddetZ = z0 + scale * (detZabs[nrdetrows] - src_z_abs);
             int start_imgZ_ind = 0;
             int end_imgZ_ind = nrplanes;
-            int pImgCopyOffset = pImgOffset;
+            int64_t pImgCopyOffset = pImgOffset;
 
             if (enddetZ < imgZ_end)
             {
@@ -393,12 +547,12 @@ __device__ void dd3_project_row_device(
 
 __global__ void dd3_row_kernel(
     const float *volume_data,
-    const int *volume_offsets,
+    const int64_t *volume_offsets,
     const int *dims,
     const float *volume_offsets_xyz,
     const float *voxel_size,
     const unsigned char *xy_mask,
-    const int *xy_mask_offsets,
+    const int64_t *xy_mask_offsets,
     const float *src_samples,
     const float *detZabs,
     const float *detX,
@@ -450,18 +604,18 @@ __global__ void dd3_row_kernel(
     float imgZstep = mag_fac * vox_z;
     float imgZ = z0 - (nz * 0.5f * vox_z + z0) * mag_fac;
 
-    int pImgBase;
+    int64_t pImgBase;
     int trans_rowstep;
     const unsigned char *mask_row;
     if (vertical)
     {
-        pImgBase = volume_offsets[mat_id] + rownr * nx * nz;
+        pImgBase = volume_offsets[mat_id] + (int64_t)rownr * nx * nz;
         trans_rowstep = 1;
         mask_row = xy_mask + xy_mask_offsets[mat_id] + rownr * nx;
     }
     else
     {
-        pImgBase = volume_offsets[mat_id] + rownr * nz;
+        pImgBase = volume_offsets[mat_id] + (int64_t)rownr * nz;
         trans_rowstep = nx;
         mask_row = xy_mask + xy_mask_offsets[mat_id] + ny * nx + rownr * ny;
     }
@@ -612,15 +766,24 @@ static void cuda_cleanup(void **ptrs, int count)
 extern "C"
 {
     DLLEXPORT
+    void voxelized_projector_cuda_clear_cache()
+    {
+        clear_phantom_cache();
+    }
+}
+
+extern "C"
+{
+    DLLEXPORT
     int voxelized_projector_cuda(
         const float *volume_data,
-        const int *volume_offsets,
+        const int64_t *volume_offsets,
         const int *dims,
         const float *volume_offsets_xyz,
         const float *voxel_size,
         const float *mu,
         const unsigned char *xy_mask,
-        const int *xy_mask_offsets,
+        const int64_t *xy_mask_offsets,
         const float *src_samples,
         const float *src_weights,
         const float *det_cell_coords,
@@ -635,7 +798,7 @@ extern "C"
         int n_energy,
         int n_pixels,
         int n_sources,
-        int volume_data_count,
+        int64_t volume_data_count,
         float *trans_out,
         int device_id)
     {
@@ -676,9 +839,11 @@ extern "C"
             return CUDA_PROJECTOR_DETECTOR_ERROR;
         }
 
+        const int detZ_count = nrdetrows + 1;
         float *xdi = new float[nrdetcols + 1];
         float *ydi = new float[nrdetcols + 1];
-        float *detZ = new float[nrdetrows + 1];
+        float *detZ = new float[detZ_count + 1];
+        detZ[detZ_count] = 1.e12;
         if (!xdi || !ydi || !detZ)
         {
             delete[] xds;
@@ -717,17 +882,43 @@ extern "C"
         }
         xy_mask_count = xy_mask_offsets[n_materials];
 
+        int cache_status = ensure_phantom_cache(
+            device_id,
+            volume_data,
+            volume_offsets,
+            dims,
+            volume_offsets_xyz,
+            voxel_size,
+            mu,
+            xy_mask,
+            xy_mask_offsets,
+            n_materials,
+            n_energy,
+            volume_data_count,
+            xy_mask_count);
+
+        if (cache_status != CUDA_PROJECTOR_SUCCESS)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            delete[] xdi;
+            delete[] ydi;
+            delete[] detZ;
+            return cache_status;
+        }
+
         int task_count = n_sources * n_materials;
-        size_t volume_bytes = (size_t)volume_data_count * sizeof(float);
-        size_t volume_offsets_bytes = (size_t)(n_materials + 1) * sizeof(int);
-        size_t dims_bytes = (size_t)n_materials * 3 * sizeof(int);
-        size_t vector3_bytes = (size_t)n_materials * 3 * sizeof(float);
-        size_t mu_bytes = (size_t)n_energy * (size_t)n_materials * sizeof(float);
-        size_t xy_mask_bytes = (size_t)xy_mask_count * sizeof(unsigned char);
+        // size_t volume_bytes = (size_t)volume_data_count * sizeof(float);
+        // size_t volume_offsets_bytes = (size_t)(n_materials + 1) * sizeof(int64_t);
+        // size_t dims_bytes = (size_t)n_materials * 3 * sizeof(int);
+        // size_t vector3_bytes = (size_t)n_materials * 3 * sizeof(float);
+        // size_t mu_bytes = (size_t)n_energy * (size_t)n_materials * sizeof(float);
+        // size_t xy_mask_bytes = (size_t)xy_mask_count * sizeof(unsigned char);
         size_t src_samples_bytes = (size_t)n_sources * 3 * sizeof(float);
         size_t src_weights_bytes = (size_t)n_sources * sizeof(float);
         size_t xdi_bytes = (size_t)(nrdetcols + 1) * sizeof(float);
-        size_t detZ_bytes = (size_t)(nrdetrows + 1) * sizeof(float);
+        size_t detZ_bytes = (size_t)(detZ_count + 1) * sizeof(float);
         size_t task_detX_bytes = (size_t)task_count * (size_t)(nrdetcols + 3) * sizeof(float);
         size_t task_scales_bytes = (size_t)task_count * (size_t)(nrdetcols + 2) * sizeof(float);
         size_t task_scalar_bytes = (size_t)task_count * sizeof(float);
@@ -737,11 +928,12 @@ extern "C"
         size_t trans_bytes = (size_t)n_pixels * (size_t)n_energy * sizeof(float);
 
         void *ptrs[22] = {0};
-        float *d_volume_data = 0, *d_volume_offsets_xyz = 0, *d_voxel_size = 0, *d_mu = 0;
+        // float *d_volume_data = 0, *d_volume_offsets_xyz = 0, *d_voxel_size = 0, *d_mu = 0;
         float *d_src_samples = 0, *d_src_weights = 0, *d_xdi = 0, *d_ydi = 0, *d_detZ = 0;
         float *d_detX = 0, *d_scales = 0, *d_x0 = 0, *d_y0 = 0, *d_z0 = 0, *d_views = 0, *d_paths = 0, *d_trans = 0;
-        int *d_volume_offsets = 0, *d_dims = 0, *d_xy_mask_offsets = 0, *d_vertical = 0;
-        unsigned char *d_xy_mask = 0;
+        int *d_vertical = 0;
+        // int64_t *d_volume_offsets = 0, *d_xy_mask_offsets = 0;
+        // unsigned char *d_xy_mask = 0;
         int p = 0;
         cudaError_t err = cudaSuccess;
 
@@ -755,14 +947,14 @@ extern "C"
         }                                               \
     } while (0)
 
-        ALLOC_PTR(float, d_volume_data, volume_bytes);
-        ALLOC_PTR(int, d_volume_offsets, volume_offsets_bytes);
-        ALLOC_PTR(int, d_dims, dims_bytes);
-        ALLOC_PTR(float, d_volume_offsets_xyz, vector3_bytes);
-        ALLOC_PTR(float, d_voxel_size, vector3_bytes);
-        ALLOC_PTR(float, d_mu, mu_bytes);
-        ALLOC_PTR(unsigned char, d_xy_mask, xy_mask_bytes);
-        ALLOC_PTR(int, d_xy_mask_offsets, volume_offsets_bytes);
+        // ALLOC_PTR(float, d_volume_data, volume_bytes);
+        // ALLOC_PTR(int64_t, d_volume_offsets, volume_offsets_bytes);
+        // ALLOC_PTR(int, d_dims, dims_bytes);
+        // ALLOC_PTR(float, d_volume_offsets_xyz, vector3_bytes);
+        // ALLOC_PTR(float, d_voxel_size, vector3_bytes);
+        // ALLOC_PTR(float, d_mu, mu_bytes);
+        // ALLOC_PTR(unsigned char, d_xy_mask, xy_mask_bytes);
+        // ALLOC_PTR(int64_t, d_xy_mask_offsets, volume_offsets_bytes);
         ALLOC_PTR(float, d_src_samples, src_samples_bytes);
         ALLOC_PTR(float, d_src_weights, src_weights_bytes);
         ALLOC_PTR(float, d_xdi, xdi_bytes);
@@ -792,23 +984,22 @@ extern "C"
             return CUDA_PROJECTOR_MEMORY_ERROR;
         }
 
-        err = cudaMemcpy(d_volume_data, volume_data, volume_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_volume_offsets, volume_offsets, volume_offsets_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_dims, dims, dims_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_volume_offsets_xyz, volume_offsets_xyz, vector3_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_voxel_size, voxel_size, vector3_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_mu, mu, mu_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_xy_mask, xy_mask, xy_mask_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_xy_mask_offsets, xy_mask_offsets, volume_offsets_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_src_samples, src_samples, src_samples_bytes, cudaMemcpyHostToDevice);
+        // err = cudaMemcpy(d_volume_data, volume_data, volume_bytes, cudaMemcpyHostToDevice);
+        // if (err == cudaSuccess)
+        //     err = cudaMemcpy(d_volume_offsets, volume_offsets, volume_offsets_bytes, cudaMemcpyHostToDevice);
+        // if (err == cudaSuccess)
+        //     err = cudaMemcpy(d_dims, dims, dims_bytes, cudaMemcpyHostToDevice);
+        // if (err == cudaSuccess)
+        //     err = cudaMemcpy(d_volume_offsets_xyz, volume_offsets_xyz, vector3_bytes, cudaMemcpyHostToDevice);
+        // if (err == cudaSuccess)
+        //     err = cudaMemcpy(d_voxel_size, voxel_size, vector3_bytes, cudaMemcpyHostToDevice);
+        // if (err == cudaSuccess)
+        //     err = cudaMemcpy(d_mu, mu, mu_bytes, cudaMemcpyHostToDevice);
+        // if (err == cudaSuccess)
+        //     err = cudaMemcpy(d_xy_mask, xy_mask, xy_mask_bytes, cudaMemcpyHostToDevice);
+        // if (err == cudaSuccess)
+        //     err = cudaMemcpy(d_xy_mask_offsets, xy_mask_offsets, volume_offsets_bytes, cudaMemcpyHostToDevice);
+        err = cudaMemcpy(d_src_samples, src_samples, src_samples_bytes, cudaMemcpyHostToDevice);
         if (err == cudaSuccess)
             err = cudaMemcpy(d_src_weights, src_weights, src_weights_bytes, cudaMemcpyHostToDevice);
         if (err == cudaSuccess)
@@ -834,7 +1025,7 @@ extern "C"
         int threads = 256;
         int prepare_blocks = (task_count + threads - 1) / threads;
         prepare_dd3_geometry_kernel<<<prepare_blocks, threads>>>(
-            d_src_samples, d_volume_offsets_xyz, d_xdi, d_ydi, nrdetcols, n_materials, n_sources,
+            d_src_samples, g_cuda_phantom.d_volume_offsets_xyz, d_xdi, d_ydi, nrdetcols, n_materials, n_sources,
             d_detX, d_scales, d_x0, d_y0, d_z0, d_vertical);
         err = cudaGetLastError();
         if (err == cudaSuccess)
@@ -845,8 +1036,8 @@ extern "C"
         if (err == cudaSuccess)
         {
             dd3_row_kernel<<<row_blocks, threads>>>(
-                d_volume_data, d_volume_offsets, d_dims, d_volume_offsets_xyz, d_voxel_size,
-                d_xy_mask, d_xy_mask_offsets, d_src_samples, d_detZ, d_detX, d_scales,
+                g_cuda_phantom.d_volume_data, g_cuda_phantom.d_volume_offsets, g_cuda_phantom.d_dims, g_cuda_phantom.d_volume_offsets_xyz, g_cuda_phantom.d_voxel_size,
+                g_cuda_phantom.d_xy_mask, g_cuda_phantom.d_xy_mask_offsets, d_src_samples, d_detZ, d_detX, d_scales,
                 d_x0, d_y0, d_z0, d_vertical, nrdetcols, nrdetrows, n_materials, n_sources,
                 max_rows, d_views);
             err = cudaGetLastError();
@@ -859,7 +1050,7 @@ extern "C"
         if (err == cudaSuccess)
         {
             dd3_scale_kernel<<<path_blocks, threads>>>(
-                d_detZ, d_src_samples, d_voxel_size, d_detX, d_scales, d_x0, d_y0, d_views,
+                d_detZ, d_src_samples, g_cuda_phantom.d_voxel_size, d_detX, d_scales, d_x0, d_y0, d_views,
                 nrdetcols, nrdetrows, n_materials, n_pixels, n_sources, d_paths);
             err = cudaGetLastError();
             if (err == cudaSuccess)
@@ -871,7 +1062,7 @@ extern "C"
         if (err == cudaSuccess)
         {
             combine_trans_kernel<<<trans_blocks, threads>>>(
-                d_paths, d_mu, d_src_weights, n_materials, n_energy, n_pixels, n_sources, d_trans);
+                d_paths, g_cuda_phantom.d_mu, d_src_weights, n_materials, n_energy, n_pixels, n_sources, d_trans);
             err = cudaGetLastError();
             if (err == cudaSuccess)
                 err = cudaDeviceSynchronize();

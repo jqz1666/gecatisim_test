@@ -76,6 +76,12 @@ def C_Projector_Voxelized_CUDA(cfg, viewId, subViewId):
         raise RuntimeError(f"Native CUDA voxelized projector failed with status {status}.")
 
     cfg.thisSubView *= trans
+
+    if viewId == cfg.sim.stopViewId and subViewId == cfg.sim.subViewCount - 1:
+        clear_cache = getattr(lib, "voxelized_projector_cuda_clear_cache", None)
+        if clear_cache is not None:
+            clear_cache()
+
     return cfg
 
 
@@ -92,13 +98,13 @@ def _load_cuda_lib(cfg=None):
     lib = cdll.LoadLibrary(lib_path)
     lib.voxelized_projector_cuda.argtypes = [
         ndpointer(c_float, flags="C_CONTIGUOUS"),
-        ndpointer(c_int, flags="C_CONTIGUOUS"),
+        ndpointer(c_int64, flags="C_CONTIGUOUS"),
         ndpointer(c_int, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_ubyte, flags="C_CONTIGUOUS"),
-        ndpointer(c_int, flags="C_CONTIGUOUS"),
+        ndpointer(c_int64, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
@@ -113,7 +119,7 @@ def _load_cuda_lib(cfg=None):
         c_int,
         c_int,
         c_int,
-        c_int,
+        c_int64,
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         c_int,
     ]
@@ -121,6 +127,13 @@ def _load_cuda_lib(cfg=None):
 
     _CUDA_LIB = lib
     _CUDA_LIB_PATH = lib_path
+
+    try:
+        lib.voxelized_projector_cuda_clear_cache.argtypes = []
+        lib.voxelized_projector_cuda_clear_cache.restype = None
+    except AttributeError:
+        pass
+
     return lib
 
 
@@ -152,12 +165,12 @@ def _get_or_create_host_cache(cfg):
         return cache
 
     volumes = gpu_data["volumes"]
-    volume_offsets = np.zeros(len(volumes) + 1, dtype=np.int32)
+    volume_offsets = np.zeros(len(volumes) + 1, dtype=np.int64)
     for idx, volume in enumerate(volumes):
         volume_offsets[idx + 1] = volume_offsets[idx] + volume["data"].size
 
     volume_data = np.empty(volume_offsets[-1], dtype=np.float32)
-    xy_mask_offsets = np.zeros(len(volumes) + 1, dtype=np.int32)
+    xy_mask_offsets = np.zeros(len(volumes) + 1, dtype=np.int64)
     for idx, volume in enumerate(volumes):
         dims = np.asarray(volume["dims"], dtype=np.int32)
         xy_mask_offsets[idx + 1] = xy_mask_offsets[idx] + int(dims[0] * dims[1] * 2)
@@ -185,13 +198,13 @@ def _get_or_create_host_cache(cfg):
     cache = {
         "phantom_signature": signature,
         "volume_data": np.ascontiguousarray(volume_data, dtype=np.float32),
-        "volume_offsets": np.ascontiguousarray(volume_offsets, dtype=np.int32),
+        "volume_offsets": np.ascontiguousarray(volume_offsets, dtype=np.int64),
         "dims": np.ascontiguousarray(dims, dtype=np.int32),
         "volume_offsets_xyz": np.ascontiguousarray(volume_offsets_xyz, dtype=np.float32),
         "voxel_size": np.ascontiguousarray(voxel_size, dtype=np.float32),
         "mu": np.ascontiguousarray(gpu_data["mus"], dtype=np.float32),
         "xy_mask": np.ascontiguousarray(xy_mask, dtype=np.uint8),
-        "xy_mask_offsets": np.ascontiguousarray(xy_mask_offsets, dtype=np.int32),
+        "xy_mask_offsets": np.ascontiguousarray(xy_mask_offsets, dtype=np.int64),
     }
     cfg.phantom._cudaProjectorHostCache = cache
     return cache

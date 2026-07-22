@@ -33,7 +33,7 @@ if errorlevel 1 (
 )
 
 :have_cl
-nvcc -O3 --use_fast_math -Xcompiler="/MD" -shared "%SRC%" -o "%OUT%"
+nvcc -O3 -Xcompiler="/MD" -shared "%SRC%" -o "%OUT%"
 if errorlevel 1 (
     echo ERROR: CUDA voxel projector build failed.
     exit /b 1

@@ -314,30 +314,21 @@ static void dd3_boundaries(int nrBoundaries, const float *centers, float *bounda
     }
 }
 
-__global__ void prepare_dd3_geometry_kernel(
+static void prepare_dd3_geometry_host(
     const float *src_samples,
     const float *volume_offsets_xyz,
     const float *xdi,
     const float *ydi,
     int nrdetcols,
-    int n_materials,
-    int n_sources,
+    int mat_id,
+    int src_id,
     float *detX,
     float *scales,
     float *x0_local,
     float *y0_local,
     float *z0_local,
-    int *vertical_flags)
+    int *vertical_flag)
 {
-    int task = blockIdx.x * blockDim.x + threadIdx.x;
-    int task_count = n_sources * n_materials;
-    if (task >= task_count)
-    {
-        return;
-    }
-
-    int mat_id = task % n_materials;
-    int src_id = task / n_materials;
     float xoff = volume_offsets_xyz[mat_id * 3 + 0];
     float yoff = volume_offsets_xyz[mat_id * 3 + 1];
     float zoff = volume_offsets_xyz[mat_id * 3 + 2];
@@ -349,18 +340,15 @@ __global__ void prepare_dd3_geometry_kernel(
     y0 -= yoff;
     z0 -= zoff;
 
-    float *task_detX = detX + (size_t)task * (size_t)(nrdetcols + 3);
-    float *task_scales = scales + (size_t)task * (size_t)(nrdetcols + 2);
-    task_detX[0] = 1.0e12f;
-
+    detX[0] = 1.0e12f;
     if (vertical)
     {
         for (int i = 0; i < nrdetcols + 1; ++i)
         {
             float xr = xdi[i] - xoff;
             float yr = ydi[i] - yoff;
-            task_detX[i + 1] = (x0 * yr - xr * y0) / (yr - y0);
-            task_scales[i + 1] = y0 / (y0 - yr);
+            detX[i + 1] = (x0 * yr - xr * y0) / (yr - y0);
+            scales[i + 1] = y0 / (y0 - yr);
         }
     }
     else
@@ -369,25 +357,25 @@ __global__ void prepare_dd3_geometry_kernel(
         {
             float xr = xdi[i] - xoff;
             float yr = ydi[i] - yoff;
-            task_detX[i + 1] = -(y0 * xr - yr * x0) / (xr - x0);
-            task_scales[i + 1] = x0 / (x0 - xr);
+            detX[i + 1] = -(y0 * xr - yr * x0) / (xr - x0);
+            scales[i + 1] = x0 / (x0 - xr);
         }
         float old_x0 = x0;
         x0 = -y0;
         y0 = -old_x0;
     }
 
-    task_detX[nrdetcols + 2] = 1.0e12f;
-    task_scales[0] = task_scales[1];
+    detX[nrdetcols + 2] = 1.0e12f;
+    scales[0] = scales[1];
     for (int i = 1; i <= nrdetcols; ++i)
     {
-        task_scales[i] = 0.5f * (task_scales[i] + task_scales[i + 1]);
+        scales[i] = 0.5f * (scales[i] + scales[i + 1]);
     }
 
-    x0_local[task] = x0;
-    y0_local[task] = y0;
-    z0_local[task] = z0;
-    vertical_flags[task] = vertical;
+    *x0_local = x0;
+    *y0_local = y0;
+    *z0_local = z0;
+    *vertical_flag = vertical;
 }
 
 __device__ void dd3_project_row_device(
@@ -563,29 +551,17 @@ __global__ void dd3_row_kernel(
     const int *vertical_flags,
     int nrdetcols,
     int nrdetrows,
-    int n_materials,
-    int n_sources,
-    int max_rows,
+    int mat_id,
+    int src_id,
     float *views)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int task_count = n_sources * n_materials;
-    int total = task_count * max_rows;
-    if (idx >= total)
-    {
-        return;
-    }
-
-    int task = idx / max_rows;
-    int rownr = idx - task * max_rows;
-    int mat_id = task % n_materials;
-    int src_id = task / n_materials;
+    int rownr = blockIdx.x * blockDim.x + threadIdx.x;
     int nx = dims[mat_id * 3 + 0];
     int ny = dims[mat_id * 3 + 1];
     int nz = dims[mat_id * 3 + 2];
     float vox_xy = voxel_size[mat_id * 3 + 0];
     float vox_z = voxel_size[mat_id * 3 + 2];
-    int vertical = vertical_flags[task];
+    int vertical = vertical_flags[0];
     int nrcols = vertical ? nx : ny;
     int nrrows = vertical ? ny : nx;
     if (rownr >= nrrows)
@@ -593,9 +569,9 @@ __global__ void dd3_row_kernel(
         return;
     }
 
-    float x0 = x0_local[task];
-    float y0 = y0_local[task];
-    float z0 = z0_local[task];
+    float x0 = x0_local[0];
+    float y0 = y0_local[0];
+    float z0 = z0_local[0];
     float mag_fac = y0 / (y0 - ((nrrows - 1) * 0.5f - rownr) * vox_xy);
     float imgXstep = mag_fac * vox_xy;
     float imgX = -x0 / (y0 - ((nrrows - 1) * 0.5f - rownr) * vox_xy) *
@@ -620,9 +596,9 @@ __global__ void dd3_row_kernel(
         mask_row = xy_mask + xy_mask_offsets[mat_id] + ny * nx + rownr * ny;
     }
 
-    const float *task_detX = detX + (size_t)task * (size_t)(nrdetcols + 3);
-    const float *task_scales = scales + (size_t)task * (size_t)(nrdetcols + 2);
-    float *task_view = views + (size_t)task * (size_t)(nrdetcols + 2) * (size_t)(nrdetrows + 2);
+    const float *task_detX = detX;
+    const float *task_scales = scales;
+    float *task_view = views;
     int increment;
     const float *detXcopy;
     const float *scalesCopy;
@@ -675,38 +651,32 @@ __global__ void dd3_scale_kernel(
     const float *views,
     int nrdetcols,
     int nrdetrows,
-    int n_materials,
+    int mat_id,
     int n_pixels,
-    int n_sources,
+    int src_id,
     float *paths)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int task_count = n_sources * n_materials;
-    int total = task_count * n_pixels;
-    if (idx >= total)
+    int pixel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel >= n_pixels)
     {
         return;
     }
 
-    int pixel = idx % n_pixels;
-    int task = idx / n_pixels;
-    int mat_id = task % n_materials;
-    int src_id = task / n_materials;
     int det_col = pixel / nrdetrows;
     int det_row = pixel - det_col * nrdetrows;
-    const float *task_detX = detX + (size_t)task * (size_t)(nrdetcols + 3);
-    const float *task_scales = scales + (size_t)task * (size_t)(nrdetcols + 2);
-    const float *task_view = views + (size_t)task * (size_t)(nrdetcols + 2) * (size_t)(nrdetrows + 2);
+    const float *task_detX = detX;
+    const float *task_scales = scales;
+    const float *task_view = views;
     int view_idx = (det_col + 1) * (nrdetrows + 2) + det_row + 1;
     float view_value = task_view[view_idx];
     if (view_value == 0.0f)
     {
-        paths[idx] = 0.0f;
+        paths[pixel] = 0.0f;
         return;
     }
 
-    float x0 = x0_local[task];
-    float y0 = y0_local[task];
+    float x0 = x0_local[0];
+    float y0 = y0_local[0];
     float deltaX = 0.5f * (task_detX[det_col + 1] + task_detX[det_col + 2]) - x0;
     float detXstep = fabsf(task_detX[det_col + 2] - task_detX[det_col + 1]);
     float scale = task_scales[det_col + 1];
@@ -717,18 +687,17 @@ __global__ void dd3_scale_kernel(
     float detZstep = fabsf(detZ1 - detZ0) * scale;
     float invCos = sqrtf(y0 * y0 + deltaX * deltaX + deltaZ * deltaZ) / fabsf(y0) *
                    voxel_size[mat_id * 3 + 0];
-    paths[idx] = invCos / (detXstep * detZstep) * view_value;
+    paths[pixel] = invCos / (detXstep * detZstep) * view_value;
 }
 
 __global__ void combine_trans_kernel(
     const float *paths,
     const float *mu,
-    const float *src_weights,
+    int MaterialIndex,
     int n_materials,
     int n_energy,
     int n_pixels,
-    int n_sources,
-    float *trans_out)
+    float *thisView)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n_pixels * n_energy;
@@ -739,20 +708,7 @@ __global__ void combine_trans_kernel(
 
     int energy = idx % n_energy;
     int pixel = idx / n_energy;
-    float trans = 0.0f;
-
-    for (int src_id = 0; src_id < n_sources; ++src_id)
-    {
-        float p_value = 0.0f;
-        for (int mat_id = 0; mat_id < n_materials; ++mat_id)
-        {
-            int path_idx = (src_id * n_materials + mat_id) * n_pixels + pixel;
-            p_value += paths[path_idx] * mu[energy * n_materials + mat_id];
-        }
-        trans += src_weights[src_id] * expf(-p_value);
-    }
-
-    trans_out[idx] = trans;
+    thisView[idx] = paths[pixel] * mu[energy * n_materials + (MaterialIndex - 1)];
 }
 
 static void cuda_cleanup(void **ptrs, int count)
@@ -784,8 +740,7 @@ extern "C"
         const float *mu,
         const unsigned char *xy_mask,
         const int64_t *xy_mask_offsets,
-        const float *src_samples,
-        const float *src_weights,
+        const float *sourcePoints,
         const float *det_cell_coords,
         const int *det_mod_types,
         const float *det_mod_coords,
@@ -797,21 +752,23 @@ extern "C"
         int n_materials,
         int n_energy,
         int n_pixels,
-        int n_sources,
+        int MaterialIndex,
+        int MaterialIndexInMemory,
         int64_t volume_data_count,
-        float *trans_out,
+        float *thisView,
         int device_id)
     {
         (void)det_start_indices;
 
         if (!volume_data || !volume_offsets || !dims || !volume_offsets_xyz || !voxel_size || !mu ||
-            !xy_mask || !xy_mask_offsets || !src_samples || !src_weights || !det_cell_coords ||
-            !det_mod_types || !det_mod_coords || !det_uvecs || !det_vvecs || !trans_out)
+            !xy_mask || !xy_mask_offsets || !sourcePoints || !det_cell_coords ||
+            !det_mod_types || !det_mod_coords || !det_uvecs || !det_vvecs || !thisView)
         {
             return CUDA_PROJECTOR_BAD_ARGUMENT;
         }
         if (det_cells_per_mod <= 0 || n_modules <= 0 || n_materials <= 0 || n_energy <= 0 ||
-            n_pixels <= 0 || n_sources <= 0 || volume_data_count <= 0)
+            n_pixels <= 0 || MaterialIndex <= 0 || MaterialIndex > n_materials ||
+            MaterialIndexInMemory <= 0 || MaterialIndexInMemory > n_materials || volume_data_count <= 0)
         {
             return CUDA_PROJECTOR_BAD_ARGUMENT;
         }
@@ -869,18 +826,7 @@ extern "C"
             return CUDA_PROJECTOR_RUNTIME_ERROR;
         }
 
-        int max_rows = 0;
-        int xy_mask_count = 0;
-        for (int mat = 0; mat < n_materials; ++mat)
-        {
-            int nx = dims[mat * 3 + 0];
-            int ny = dims[mat * 3 + 1];
-            if (nx > max_rows)
-                max_rows = nx;
-            if (ny > max_rows)
-                max_rows = ny;
-        }
-        xy_mask_count = xy_mask_offsets[n_materials];
+        int64_t xy_mask_count = xy_mask_offsets[n_materials];
 
         int cache_status = ensure_phantom_cache(
             device_id,
@@ -908,29 +854,41 @@ extern "C"
             return cache_status;
         }
 
-        int task_count = n_sources * n_materials;
+        float *detX = new float[nrdetcols + 3];
+        float *scales = new float[nrdetcols + 2];
+        if (!detX || !scales)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            delete[] xdi;
+            delete[] ydi;
+            delete[] detZ;
+            delete[] detX;
+            delete[] scales;
+            return CUDA_PROJECTOR_MEMORY_ERROR;
+        }
+
         // size_t volume_bytes = (size_t)volume_data_count * sizeof(float);
         // size_t volume_offsets_bytes = (size_t)(n_materials + 1) * sizeof(int64_t);
         // size_t dims_bytes = (size_t)n_materials * 3 * sizeof(int);
         // size_t vector3_bytes = (size_t)n_materials * 3 * sizeof(float);
         // size_t mu_bytes = (size_t)n_energy * (size_t)n_materials * sizeof(float);
         // size_t xy_mask_bytes = (size_t)xy_mask_count * sizeof(unsigned char);
-        size_t src_samples_bytes = (size_t)n_sources * 3 * sizeof(float);
-        size_t src_weights_bytes = (size_t)n_sources * sizeof(float);
-        size_t xdi_bytes = (size_t)(nrdetcols + 1) * sizeof(float);
+        size_t sourcePoints_bytes = 3 * sizeof(float);
         size_t detZ_bytes = (size_t)(detZ_count + 1) * sizeof(float);
-        size_t task_detX_bytes = (size_t)task_count * (size_t)(nrdetcols + 3) * sizeof(float);
-        size_t task_scales_bytes = (size_t)task_count * (size_t)(nrdetcols + 2) * sizeof(float);
-        size_t task_scalar_bytes = (size_t)task_count * sizeof(float);
-        size_t task_int_bytes = (size_t)task_count * sizeof(int);
-        size_t views_bytes = (size_t)task_count * (size_t)(nrdetcols + 2) * (size_t)(nrdetrows + 2) * sizeof(float);
-        size_t paths_bytes = (size_t)task_count * (size_t)n_pixels * sizeof(float);
-        size_t trans_bytes = (size_t)n_pixels * (size_t)n_energy * sizeof(float);
+        size_t detX_bytes = (size_t)(nrdetcols + 3) * sizeof(float);
+        size_t scales_bytes = (size_t)(nrdetcols + 2) * sizeof(float);
+        size_t scalar_bytes = sizeof(float);
+        size_t int_bytes = sizeof(int);
+        size_t views_bytes = (size_t)(nrdetcols + 2) * (size_t)(nrdetrows + 2) * sizeof(float);
+        size_t paths_bytes = (size_t)n_pixels * sizeof(float);
+        size_t thisView_bytes = (size_t)n_pixels * (size_t)n_energy * sizeof(float);
 
-        void *ptrs[22] = {0};
+        void *ptrs[12] = {0};
         // float *d_volume_data = 0, *d_volume_offsets_xyz = 0, *d_voxel_size = 0, *d_mu = 0;
-        float *d_src_samples = 0, *d_src_weights = 0, *d_xdi = 0, *d_ydi = 0, *d_detZ = 0;
-        float *d_detX = 0, *d_scales = 0, *d_x0 = 0, *d_y0 = 0, *d_z0 = 0, *d_views = 0, *d_paths = 0, *d_trans = 0;
+        float *d_sourcePoints = 0, *d_detZ = 0;
+        float *d_detX = 0, *d_scales = 0, *d_x0 = 0, *d_y0 = 0, *d_z0 = 0, *d_views = 0, *d_paths = 0, *d_thisView = 0;
         int *d_vertical = 0;
         // int64_t *d_volume_offsets = 0, *d_xy_mask_offsets = 0;
         // unsigned char *d_xy_mask = 0;
@@ -955,20 +913,17 @@ extern "C"
         // ALLOC_PTR(float, d_mu, mu_bytes);
         // ALLOC_PTR(unsigned char, d_xy_mask, xy_mask_bytes);
         // ALLOC_PTR(int64_t, d_xy_mask_offsets, volume_offsets_bytes);
-        ALLOC_PTR(float, d_src_samples, src_samples_bytes);
-        ALLOC_PTR(float, d_src_weights, src_weights_bytes);
-        ALLOC_PTR(float, d_xdi, xdi_bytes);
-        ALLOC_PTR(float, d_ydi, xdi_bytes);
+        ALLOC_PTR(float, d_sourcePoints, sourcePoints_bytes);
         ALLOC_PTR(float, d_detZ, detZ_bytes);
-        ALLOC_PTR(float, d_detX, task_detX_bytes);
-        ALLOC_PTR(float, d_scales, task_scales_bytes);
-        ALLOC_PTR(float, d_x0, task_scalar_bytes);
-        ALLOC_PTR(float, d_y0, task_scalar_bytes);
-        ALLOC_PTR(float, d_z0, task_scalar_bytes);
-        ALLOC_PTR(int, d_vertical, task_int_bytes);
+        ALLOC_PTR(float, d_detX, detX_bytes);
+        ALLOC_PTR(float, d_scales, scales_bytes);
+        ALLOC_PTR(float, d_x0, scalar_bytes);
+        ALLOC_PTR(float, d_y0, scalar_bytes);
+        ALLOC_PTR(float, d_z0, scalar_bytes);
+        ALLOC_PTR(int, d_vertical, int_bytes);
         ALLOC_PTR(float, d_views, views_bytes);
         ALLOC_PTR(float, d_paths, paths_bytes);
-        ALLOC_PTR(float, d_trans, trans_bytes);
+        ALLOC_PTR(float, d_thisView, thisView_bytes);
 
 #undef ALLOC_PTR
 
@@ -981,6 +936,8 @@ extern "C"
             delete[] xdi;
             delete[] ydi;
             delete[] detZ;
+            delete[] detX;
+            delete[] scales;
             return CUDA_PROJECTOR_MEMORY_ERROR;
         }
 
@@ -999,17 +956,9 @@ extern "C"
         //     err = cudaMemcpy(d_xy_mask, xy_mask, xy_mask_bytes, cudaMemcpyHostToDevice);
         // if (err == cudaSuccess)
         //     err = cudaMemcpy(d_xy_mask_offsets, xy_mask_offsets, volume_offsets_bytes, cudaMemcpyHostToDevice);
-        err = cudaMemcpy(d_src_samples, src_samples, src_samples_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_src_weights, src_weights, src_weights_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_xdi, xdi, xdi_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemcpy(d_ydi, ydi, xdi_bytes, cudaMemcpyHostToDevice);
+        err = cudaMemcpy(d_sourcePoints, sourcePoints, sourcePoints_bytes, cudaMemcpyHostToDevice);
         if (err == cudaSuccess)
             err = cudaMemcpy(d_detZ, detZ, detZ_bytes, cudaMemcpyHostToDevice);
-        if (err == cudaSuccess)
-            err = cudaMemset(d_views, 0, views_bytes);
         if (err != cudaSuccess)
         {
             cuda_cleanup(ptrs, p);
@@ -1019,55 +968,78 @@ extern "C"
             delete[] xdi;
             delete[] ydi;
             delete[] detZ;
+            delete[] detX;
+            delete[] scales;
             return CUDA_PROJECTOR_RUNTIME_ERROR;
         }
 
         int threads = 256;
-        int prepare_blocks = (task_count + threads - 1) / threads;
-        prepare_dd3_geometry_kernel<<<prepare_blocks, threads>>>(
-            d_src_samples, g_cuda_phantom.d_volume_offsets_xyz, d_xdi, d_ydi, nrdetcols, n_materials, n_sources,
-            d_detX, d_scales, d_x0, d_y0, d_z0, d_vertical);
-        err = cudaGetLastError();
-        if (err == cudaSuccess)
-            err = cudaDeviceSynchronize();
+        int view_total = n_pixels * n_energy;
+        int view_blocks = (view_total + threads - 1) / threads;
+        int path_blocks = (n_pixels + threads - 1) / threads;
 
-        int row_total = task_count * max_rows;
-        int row_blocks = (row_total + threads - 1) / threads;
+        int mat_id = MaterialIndexInMemory - 1;
+        float x0_local = 0.0f;
+        float y0_local = 0.0f;
+        float z0_local = 0.0f;
+        int vertical_flag = 0;
+        prepare_dd3_geometry_host(
+            sourcePoints, volume_offsets_xyz, xdi, ydi, nrdetcols, mat_id, 0,
+            detX, scales, &x0_local, &y0_local, &z0_local, &vertical_flag);
+
+        err = cudaMemcpy(d_detX, detX, detX_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_scales, scales, scales_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_x0, &x0_local, scalar_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_y0, &y0_local, scalar_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_z0, &z0_local, scalar_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_vertical, &vertical_flag, int_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemset(d_views, 0, views_bytes);
+
+        int nx = dims[mat_id * 3 + 0];
+        int ny = dims[mat_id * 3 + 1];
+        int nrrows = vertical_flag ? ny : nx;
+        int row_blocks = (nrrows + threads - 1) / threads;
         if (err == cudaSuccess)
         {
             dd3_row_kernel<<<row_blocks, threads>>>(
                 g_cuda_phantom.d_volume_data, g_cuda_phantom.d_volume_offsets, g_cuda_phantom.d_dims, g_cuda_phantom.d_volume_offsets_xyz, g_cuda_phantom.d_voxel_size,
-                g_cuda_phantom.d_xy_mask, g_cuda_phantom.d_xy_mask_offsets, d_src_samples, d_detZ, d_detX, d_scales,
-                d_x0, d_y0, d_z0, d_vertical, nrdetcols, nrdetrows, n_materials, n_sources,
-                max_rows, d_views);
+                g_cuda_phantom.d_xy_mask, g_cuda_phantom.d_xy_mask_offsets, d_sourcePoints, d_detZ, d_detX, d_scales,
+                d_x0, d_y0, d_z0, d_vertical, nrdetcols, nrdetrows, mat_id, 0, d_views);
             err = cudaGetLastError();
             if (err == cudaSuccess)
                 err = cudaDeviceSynchronize();
         }
 
-        int path_total = task_count * n_pixels;
-        int path_blocks = (path_total + threads - 1) / threads;
         if (err == cudaSuccess)
         {
             dd3_scale_kernel<<<path_blocks, threads>>>(
-                d_detZ, d_src_samples, g_cuda_phantom.d_voxel_size, d_detX, d_scales, d_x0, d_y0, d_views,
-                nrdetcols, nrdetrows, n_materials, n_pixels, n_sources, d_paths);
+                d_detZ, d_sourcePoints, g_cuda_phantom.d_voxel_size, d_detX, d_scales, d_x0, d_y0, d_views,
+                nrdetcols, nrdetrows, mat_id, n_pixels, 0, d_paths);
             err = cudaGetLastError();
             if (err == cudaSuccess)
                 err = cudaDeviceSynchronize();
         }
 
-        int trans_total = n_pixels * n_energy;
-        int trans_blocks = (trans_total + threads - 1) / threads;
         if (err == cudaSuccess)
         {
-            combine_trans_kernel<<<trans_blocks, threads>>>(
-                d_paths, g_cuda_phantom.d_mu, d_src_weights, n_materials, n_energy, n_pixels, n_sources, d_trans);
+            combine_trans_kernel<<<view_blocks, threads>>>(
+                d_paths, g_cuda_phantom.d_mu, MaterialIndex, n_materials, n_energy, n_pixels, d_thisView);
             err = cudaGetLastError();
             if (err == cudaSuccess)
                 err = cudaDeviceSynchronize();
+        }
+
+        if (err == cudaSuccess)
+        {
+            err = cudaGetLastError();
             if (err == cudaSuccess)
-                err = cudaMemcpy(trans_out, d_trans, trans_bytes, cudaMemcpyDeviceToHost);
+                err = cudaMemcpy(thisView, d_thisView, thisView_bytes, cudaMemcpyDeviceToHost);
         }
 
         cuda_cleanup(ptrs, p);
@@ -1077,6 +1049,8 @@ extern "C"
         delete[] xdi;
         delete[] ydi;
         delete[] detZ;
+        delete[] detX;
+        delete[] scales;
 
         if (err != cudaSuccess)
         {

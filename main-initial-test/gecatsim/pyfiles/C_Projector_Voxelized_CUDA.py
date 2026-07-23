@@ -30,50 +30,63 @@ def C_Projector_Voxelized_CUDA(cfg, viewId, subViewId):
     src = cfg.srcNew
     n_pixels = int(det.totalNumCells)
     n_energy = int(cfg.spec.nEbin)
-    n_sources = int(src.nSamples)
     n_modules = int(det.nMod)
     n_materials = int(cfg.phantom.numberOfMaterials)
     det_cells_per_mod = int(det.nCells)
     device_id = int(getattr(cfg.physics, "gpuDeviceId", 0))
 
-    src_samples = np.ascontiguousarray(src.samples, dtype=np.float32)
-    src_weights = np.ascontiguousarray(src.weights.reshape(-1), dtype=np.float32)
     det_cell_coords = np.ascontiguousarray(det.cellCoords, dtype=np.float32)
     det_mod_coords = np.ascontiguousarray(det.modCoords, dtype=np.float32)
     det_uvecs = np.ascontiguousarray(det.uvecs, dtype=np.float32)
     det_vvecs = np.ascontiguousarray(det.vvecs, dtype=np.float32)
     det_start_indices = np.ascontiguousarray(det.startIndices, dtype=np.int32)
-    trans = np.empty((n_pixels, n_energy), dtype=np.float32)
+    mod_type_inds = np.ascontiguousarray(det.modTypes.reshape(-1), dtype=np.int32)
 
-    status = lib.voxelized_projector_cuda(
-        host["volume_data"],
-        host["volume_offsets"],
-        host["dims"],
-        host["volume_offsets_xyz"],
-        host["voxel_size"],
-        host["mu"],
-        host["xy_mask"],
-        host["xy_mask_offsets"],
-        src_samples,
-        src_weights,
-        det_cell_coords,
-        np.ascontiguousarray(det.modTypes.reshape(-1), dtype=np.int32),
-        det_mod_coords,
-        det_uvecs,
-        det_vvecs,
-        det_start_indices,
-        det_cells_per_mod,
-        n_modules,
-        n_materials,
-        n_energy,
-        n_pixels,
-        n_sources,
-        int(host["volume_data"].size),
-        trans,
-        device_id,
-    )
-    if status != 0:
-        raise RuntimeError(f"Native CUDA voxelized projector failed with status {status}.")
+    trans = np.zeros((n_pixels, n_energy), dtype=np.float32)
+    matPVS = np.zeros((n_pixels, n_energy), dtype=np.float32)
+
+    for srcId in range(src.nSamples):
+        theSourcePoint = np.ascontiguousarray(src.samples[srcId, :], dtype=np.float32)
+        pValueSpectrum = np.zeros((n_pixels, n_energy), dtype=np.float32)
+
+        for matId in range(n_materials):
+            matPVS[:] = 0
+            MaterialIndex = matId + 1
+            MaterialIndexInMemory = MaterialIndex
+
+            status = lib.voxelized_projector_cuda(
+                host["volume_data"],
+                host["volume_offsets"],
+                host["dims"],
+                host["volume_offsets_xyz"],
+                host["voxel_size"],
+                host["mu"],
+                host["xy_mask"],
+                host["xy_mask_offsets"],
+                theSourcePoint,
+                det_cell_coords,
+                mod_type_inds,
+                det_mod_coords,
+                det_uvecs,
+                det_vvecs,
+                det_start_indices,
+                det_cells_per_mod,
+                n_modules,
+                n_materials,
+                n_energy,
+                n_pixels,
+                MaterialIndex,
+                MaterialIndexInMemory,
+                int(host["volume_data"].size),
+                matPVS,
+                device_id,
+            )
+            if status != 0:
+                raise RuntimeError(f"Native CUDA voxelized projector failed with status {status}.")
+
+            pValueSpectrum += matPVS
+
+        trans += src.weights[0, srcId] * np.exp(-pValueSpectrum)
 
     cfg.thisSubView *= trans
 
@@ -107,12 +120,12 @@ def _load_cuda_lib(cfg=None):
         ndpointer(c_int64, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
-        ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_int, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_float, flags="C_CONTIGUOUS"),
         ndpointer(c_int, flags="C_CONTIGUOUS"),
+        c_int,
         c_int,
         c_int,
         c_int,

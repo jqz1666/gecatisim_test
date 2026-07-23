@@ -72,7 +72,6 @@ int main(int argc, char **argv) {
 
     const int n_materials = 1;
     const int n_energy = 2;
-    const int n_sources = 1;
     const int n_modules = 1;
     const int det_cells_per_mod = 4;
     const int n_pixels = 4;
@@ -96,8 +95,7 @@ int main(int argc, char **argv) {
     }
     int64_t xy_mask_offsets[n_materials + 1] = {0, (int64_t)nx * ny * 2};
 
-    float src_samples[n_sources * 3] = {0.0f, 80.0f, 0.0f};
-    float src_weights[n_sources] = {1.0f};
+    float sourcePoints[3] = {0.0f, 80.0f, 0.0f};
 
     // Detector cell coordinates are ordered as row + col * nRows.
     float det_cell_coords[det_cells_per_mod * 2] = {
@@ -112,9 +110,9 @@ int main(int argc, char **argv) {
     float det_vvecs[n_modules * 3] = {0.0f, 0.0f, 1.0f};
     int det_start_indices[n_modules] = {0};
 
-    float trans_out[n_pixels * n_energy];
+    float thisView[n_pixels * n_energy];
     for (int i = 0; i < n_pixels * n_energy; ++i) {
-        trans_out[i] = -1.0f;
+        thisView[i] = -1.0f;
     }
 
     std::printf("Calling voxelized_projector_cuda with a %dx%dx%d volume and 2x2 detector...\n", nx, ny, nz);
@@ -127,8 +125,7 @@ int main(int argc, char **argv) {
         mu,
         xy_mask,
         xy_mask_offsets,
-        src_samples,
-        src_weights,
+        sourcePoints,
         det_cell_coords,
         det_mod_types,
         det_mod_coords,
@@ -140,9 +137,10 @@ int main(int argc, char **argv) {
         n_materials,
         n_energy,
         n_pixels,
-        n_sources,
+        1,
+        1,
         volume_data_count,
-        trans_out,
+        thisView,
         device_id);
 
     std::printf("Status: %d (%s)\n", status, status_name(status));
@@ -153,7 +151,7 @@ int main(int argc, char **argv) {
     for (int pixel = 0; pixel < n_pixels; ++pixel) {
         std::printf("pixel %d:", pixel);
         for (int energy = 0; energy < n_energy; ++energy) {
-            std::printf(" %.8f", trans_out[pixel * n_energy + energy]);
+            std::printf(" %.8f", thisView[pixel * n_energy + energy]);
         }
         std::printf("\n");
     }

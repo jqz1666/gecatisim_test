@@ -690,27 +690,6 @@ __global__ void dd3_scale_kernel(
     paths[pixel] = invCos / (detXstep * detZstep) * view_value;
 }
 
-__global__ void combine_trans_kernel(
-    const float *paths,
-    const float *mu,
-    int MaterialIndex,
-    int n_materials,
-    int n_energy,
-    int n_pixels,
-    float *thisView)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n_pixels * n_energy;
-    if (idx >= total)
-    {
-        return;
-    }
-
-    int energy = idx % n_energy;
-    int pixel = idx / n_energy;
-    thisView[idx] = paths[pixel] * mu[energy * n_materials + (MaterialIndex - 1)];
-}
-
 static void cuda_cleanup(void **ptrs, int count)
 {
     for (int i = 0; i < count; ++i)
@@ -883,12 +862,11 @@ extern "C"
         size_t int_bytes = sizeof(int);
         size_t views_bytes = (size_t)(nrdetcols + 2) * (size_t)(nrdetrows + 2) * sizeof(float);
         size_t paths_bytes = (size_t)n_pixels * sizeof(float);
-        size_t thisView_bytes = (size_t)n_pixels * (size_t)n_energy * sizeof(float);
 
         void *ptrs[12] = {0};
         // float *d_volume_data = 0, *d_volume_offsets_xyz = 0, *d_voxel_size = 0, *d_mu = 0;
         float *d_sourcePoints = 0, *d_detZ = 0;
-        float *d_detX = 0, *d_scales = 0, *d_x0 = 0, *d_y0 = 0, *d_z0 = 0, *d_views = 0, *d_paths = 0, *d_thisView = 0;
+        float *d_detX = 0, *d_scales = 0, *d_x0 = 0, *d_y0 = 0, *d_z0 = 0, *d_views = 0, *d_paths = 0;
         int *d_vertical = 0;
         // int64_t *d_volume_offsets = 0, *d_xy_mask_offsets = 0;
         // unsigned char *d_xy_mask = 0;
@@ -923,7 +901,6 @@ extern "C"
         ALLOC_PTR(int, d_vertical, int_bytes);
         ALLOC_PTR(float, d_views, views_bytes);
         ALLOC_PTR(float, d_paths, paths_bytes);
-        ALLOC_PTR(float, d_thisView, thisView_bytes);
 
 #undef ALLOC_PTR
 
@@ -974,8 +951,6 @@ extern "C"
         }
 
         int threads = 256;
-        int view_total = n_pixels * n_energy;
-        int view_blocks = (view_total + threads - 1) / threads;
         int path_blocks = (n_pixels + threads - 1) / threads;
 
         int mat_id = MaterialIndexInMemory - 1;
@@ -1028,18 +1003,31 @@ extern "C"
 
         if (err == cudaSuccess)
         {
-            combine_trans_kernel<<<view_blocks, threads>>>(
-                d_paths, g_cuda_phantom.d_mu, MaterialIndex, n_materials, n_energy, n_pixels, d_thisView);
             err = cudaGetLastError();
             if (err == cudaSuccess)
-                err = cudaDeviceSynchronize();
-        }
-
-        if (err == cudaSuccess)
-        {
-            err = cudaGetLastError();
-            if (err == cudaSuccess)
-                err = cudaMemcpy(thisView, d_thisView, thisView_bytes, cudaMemcpyDeviceToHost);
+            {
+                float *paths = new float[n_pixels];
+                if (!paths)
+                {
+                    err = cudaErrorMemoryAllocation;
+                }
+                else
+                {
+                    err = cudaMemcpy(paths, d_paths, paths_bytes, cudaMemcpyDeviceToHost);
+                    if (err == cudaSuccess)
+                    {
+                        for (int detIndex = 0; detIndex < n_pixels; detIndex++)
+                        {
+                            for (int EnergyBin = 0; EnergyBin < n_energy; EnergyBin++)
+                            {
+                                thisView[detIndex * n_energy + EnergyBin] =
+                                    paths[detIndex] * mu[EnergyBin * n_materials + (MaterialIndex - 1)];
+                            }
+                        }
+                    }
+                    delete[] paths;
+                }
+            }
         }
 
         cuda_cleanup(ptrs, p);

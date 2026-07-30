@@ -711,6 +711,43 @@ __global__ void combine_trans_kernel(
     thisView[idx] = paths[pixel] * mu[energy * n_materials + (MaterialIndex - 1)];
 }
 
+__global__ void accumulate_pvalue_kernel(
+    const float *paths,
+    const float *mu,
+    int mat_id,
+    int n_materials,
+    int n_energy,
+    int n_pixels,
+    float *pvalue)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_pixels * n_energy;
+    if (idx >= total)
+    {
+        return;
+    }
+
+    int energy = idx % n_energy;
+    int pixel = idx / n_energy;
+    pvalue[idx] += paths[pixel] * mu[energy * n_materials + mat_id];
+}
+
+__global__ void apply_source_trans_kernel(
+    const float *pvalue,
+    const float *src_weights,
+    int src_id,
+    int total,
+    float *trans)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total)
+    {
+        return;
+    }
+
+    trans[idx] += src_weights[src_id] * expf(-pvalue[idx]);
+}
+
 static void cuda_cleanup(void **ptrs, int count)
 {
     for (int i = 0; i < count; ++i)
@@ -725,6 +762,301 @@ extern "C"
     void voxelized_projector_cuda_clear_cache()
     {
         clear_phantom_cache();
+    }
+
+    DLLEXPORT
+    int voxelized_projector_cuda_batch(
+        const float *volume_data,
+        const int64_t *volume_offsets,
+        const int *dims,
+        const float *volume_offsets_xyz,
+        const float *voxel_size,
+        const float *mu,
+        const unsigned char *xy_mask,
+        const int64_t *xy_mask_offsets,
+        const float *sourcePoints,
+        const float *sourceWeights,
+        int n_source_samples,
+        const float *det_cell_coords,
+        const int *det_mod_types,
+        const float *det_mod_coords,
+        const float *det_uvecs,
+        const float *det_vvecs,
+        const int *det_start_indices,
+        int det_cells_per_mod,
+        int n_modules,
+        int n_materials,
+        int n_energy,
+        int n_pixels,
+        int64_t volume_data_count,
+        float *trans,
+        int device_id)
+    {
+        (void)det_start_indices;
+
+        if (!volume_data || !volume_offsets || !dims || !volume_offsets_xyz || !voxel_size || !mu ||
+            !xy_mask || !xy_mask_offsets || !sourcePoints || !sourceWeights || !det_cell_coords ||
+            !det_mod_types || !det_mod_coords || !det_uvecs || !det_vvecs || !trans)
+        {
+            return CUDA_PROJECTOR_BAD_ARGUMENT;
+        }
+        if (n_source_samples <= 0 || det_cells_per_mod <= 0 || n_modules <= 0 || n_materials <= 0 ||
+            n_energy <= 0 || n_pixels <= 0 || volume_data_count <= 0)
+        {
+            return CUDA_PROJECTOR_BAD_ARGUMENT;
+        }
+
+        float *xds = 0;
+        float *yds = 0;
+        float *zds = 0;
+        int nrdetcols = 0;
+        int nrdetrows = 0;
+        int status = convert_modular_detector_compatible(
+            &xds, &yds, &zds, &nrdetcols, &nrdetrows, n_modules, det_mod_types,
+            det_vvecs, det_uvecs, det_mod_coords, det_cell_coords, det_cells_per_mod);
+        if (status != CUDA_PROJECTOR_SUCCESS)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            return status;
+        }
+        if (nrdetcols * nrdetrows != n_pixels)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            return CUDA_PROJECTOR_DETECTOR_ERROR;
+        }
+
+        const int detZ_count = nrdetrows + 1;
+        float *xdi = new float[nrdetcols + 1];
+        float *ydi = new float[nrdetcols + 1];
+        float *detZ = new float[detZ_count + 1];
+        detZ[detZ_count] = 1.e12f;
+        if (!xdi || !ydi || !detZ)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            delete[] xdi;
+            delete[] ydi;
+            delete[] detZ;
+            return CUDA_PROJECTOR_MEMORY_ERROR;
+        }
+        dd3_boundaries(nrdetcols + 1, xds, xdi);
+        dd3_boundaries(nrdetcols + 1, yds, ydi);
+        dd3_boundaries(nrdetrows + 1, zds, detZ);
+
+        if (cudaSetDevice(device_id) != cudaSuccess)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            delete[] xdi;
+            delete[] ydi;
+            delete[] detZ;
+            return CUDA_PROJECTOR_RUNTIME_ERROR;
+        }
+
+        int64_t xy_mask_count = xy_mask_offsets[n_materials];
+        int cache_status = ensure_phantom_cache(
+            device_id,
+            volume_data,
+            volume_offsets,
+            dims,
+            volume_offsets_xyz,
+            voxel_size,
+            mu,
+            xy_mask,
+            xy_mask_offsets,
+            n_materials,
+            n_energy,
+            volume_data_count,
+            xy_mask_count);
+
+        if (cache_status != CUDA_PROJECTOR_SUCCESS)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            delete[] xdi;
+            delete[] ydi;
+            delete[] detZ;
+            return cache_status;
+        }
+
+        float *detX = new float[nrdetcols + 3];
+        float *scales = new float[nrdetcols + 2];
+        if (!detX || !scales)
+        {
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            delete[] xdi;
+            delete[] ydi;
+            delete[] detZ;
+            delete[] detX;
+            delete[] scales;
+            return CUDA_PROJECTOR_MEMORY_ERROR;
+        }
+
+        size_t sourcePoints_bytes = (size_t)n_source_samples * 3 * sizeof(float);
+        size_t sourceWeights_bytes = (size_t)n_source_samples * sizeof(float);
+        size_t detZ_bytes = (size_t)(detZ_count + 1) * sizeof(float);
+        size_t detX_bytes = (size_t)(nrdetcols + 3) * sizeof(float);
+        size_t scales_bytes = (size_t)(nrdetcols + 2) * sizeof(float);
+        size_t scalar_bytes = sizeof(float);
+        size_t int_bytes = sizeof(int);
+        size_t views_bytes = (size_t)(nrdetcols + 2) * (size_t)(nrdetrows + 2) * sizeof(float);
+        size_t paths_bytes = (size_t)n_pixels * sizeof(float);
+        size_t spectrum_bytes = (size_t)n_pixels * (size_t)n_energy * sizeof(float);
+
+        void *ptrs[16] = {0};
+        float *d_sourcePoints = 0, *d_sourceWeights = 0, *d_detZ = 0;
+        float *d_detX = 0, *d_scales = 0, *d_x0 = 0, *d_y0 = 0, *d_z0 = 0;
+        float *d_views = 0, *d_paths = 0, *d_pvalue = 0, *d_trans = 0;
+        int *d_vertical = 0;
+        int p = 0;
+        cudaError_t err = cudaSuccess;
+
+#define ALLOC_PTR(type, var, bytes)                     \
+    do                                                  \
+    {                                                   \
+        if (err == cudaSuccess)                         \
+        {                                               \
+            err = cudaMalloc((void **)&(var), (bytes)); \
+            ptrs[p++] = (void *)(var);                  \
+        }                                               \
+    } while (0)
+
+        ALLOC_PTR(float, d_sourcePoints, sourcePoints_bytes);
+        ALLOC_PTR(float, d_sourceWeights, sourceWeights_bytes);
+        ALLOC_PTR(float, d_detZ, detZ_bytes);
+        ALLOC_PTR(float, d_detX, detX_bytes);
+        ALLOC_PTR(float, d_scales, scales_bytes);
+        ALLOC_PTR(float, d_x0, scalar_bytes);
+        ALLOC_PTR(float, d_y0, scalar_bytes);
+        ALLOC_PTR(float, d_z0, scalar_bytes);
+        ALLOC_PTR(int, d_vertical, int_bytes);
+        ALLOC_PTR(float, d_views, views_bytes);
+        ALLOC_PTR(float, d_paths, paths_bytes);
+        ALLOC_PTR(float, d_pvalue, spectrum_bytes);
+        ALLOC_PTR(float, d_trans, spectrum_bytes);
+
+#undef ALLOC_PTR
+
+        if (err != cudaSuccess)
+        {
+            cuda_cleanup(ptrs, p);
+            delete[] xds;
+            delete[] yds;
+            delete[] zds;
+            delete[] xdi;
+            delete[] ydi;
+            delete[] detZ;
+            delete[] detX;
+            delete[] scales;
+            return CUDA_PROJECTOR_MEMORY_ERROR;
+        }
+
+        err = cudaMemcpy(d_sourcePoints, sourcePoints, sourcePoints_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_sourceWeights, sourceWeights, sourceWeights_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_detZ, detZ, detZ_bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+            err = cudaMemset(d_trans, 0, spectrum_bytes);
+
+        int threads = 256;
+        int spectrum_total = n_pixels * n_energy;
+        int spectrum_blocks = (spectrum_total + threads - 1) / threads;
+        int path_blocks = (n_pixels + threads - 1) / threads;
+
+        for (int src_id = 0; err == cudaSuccess && src_id < n_source_samples; ++src_id)
+        {
+            err = cudaMemset(d_pvalue, 0, spectrum_bytes);
+            for (int mat_id = 0; err == cudaSuccess && mat_id < n_materials; ++mat_id)
+            {
+                float x0_local = 0.0f;
+                float y0_local = 0.0f;
+                float z0_local = 0.0f;
+                int vertical_flag = 0;
+                prepare_dd3_geometry_host(
+                    sourcePoints, volume_offsets_xyz, xdi, ydi, nrdetcols, mat_id, src_id,
+                    detX, scales, &x0_local, &y0_local, &z0_local, &vertical_flag);
+
+                err = cudaMemcpy(d_detX, detX, detX_bytes, cudaMemcpyHostToDevice);
+                if (err == cudaSuccess)
+                    err = cudaMemcpy(d_scales, scales, scales_bytes, cudaMemcpyHostToDevice);
+                if (err == cudaSuccess)
+                    err = cudaMemcpy(d_x0, &x0_local, scalar_bytes, cudaMemcpyHostToDevice);
+                if (err == cudaSuccess)
+                    err = cudaMemcpy(d_y0, &y0_local, scalar_bytes, cudaMemcpyHostToDevice);
+                if (err == cudaSuccess)
+                    err = cudaMemcpy(d_z0, &z0_local, scalar_bytes, cudaMemcpyHostToDevice);
+                if (err == cudaSuccess)
+                    err = cudaMemcpy(d_vertical, &vertical_flag, int_bytes, cudaMemcpyHostToDevice);
+                if (err == cudaSuccess)
+                    err = cudaMemset(d_views, 0, views_bytes);
+
+                int nx = dims[mat_id * 3 + 0];
+                int ny = dims[mat_id * 3 + 1];
+                int nrrows = vertical_flag ? ny : nx;
+                int row_blocks = (nrrows + threads - 1) / threads;
+                if (err == cudaSuccess)
+                {
+                    dd3_row_kernel<<<row_blocks, threads>>>(
+                        g_cuda_phantom.d_volume_data, g_cuda_phantom.d_volume_offsets, g_cuda_phantom.d_dims, g_cuda_phantom.d_volume_offsets_xyz, g_cuda_phantom.d_voxel_size,
+                        g_cuda_phantom.d_xy_mask, g_cuda_phantom.d_xy_mask_offsets, d_sourcePoints, d_detZ, d_detX, d_scales,
+                        d_x0, d_y0, d_z0, d_vertical, nrdetcols, nrdetrows, mat_id, src_id, d_views);
+                    err = cudaGetLastError();
+                }
+
+                if (err == cudaSuccess)
+                {
+                    dd3_scale_kernel<<<path_blocks, threads>>>(
+                        d_detZ, d_sourcePoints, g_cuda_phantom.d_voxel_size, d_detX, d_scales, d_x0, d_y0, d_views,
+                        nrdetcols, nrdetrows, mat_id, n_pixels, src_id, d_paths);
+                    err = cudaGetLastError();
+                }
+
+                if (err == cudaSuccess)
+                {
+                    accumulate_pvalue_kernel<<<spectrum_blocks, threads>>>(
+                        d_paths, g_cuda_phantom.d_mu, mat_id, n_materials, n_energy, n_pixels, d_pvalue);
+                    err = cudaGetLastError();
+                }
+            }
+
+            if (err == cudaSuccess)
+            {
+                apply_source_trans_kernel<<<spectrum_blocks, threads>>>(
+                    d_pvalue, d_sourceWeights, src_id, spectrum_total, d_trans);
+                err = cudaGetLastError();
+            }
+        }
+
+        if (err == cudaSuccess)
+        {
+            err = cudaMemcpy(trans, d_trans, spectrum_bytes, cudaMemcpyDeviceToHost);
+        }
+
+        cuda_cleanup(ptrs, p);
+        delete[] xds;
+        delete[] yds;
+        delete[] zds;
+        delete[] xdi;
+        delete[] ydi;
+        delete[] detZ;
+        delete[] detX;
+        delete[] scales;
+
+        if (err != cudaSuccess)
+        {
+            return CUDA_PROJECTOR_RUNTIME_ERROR;
+        }
+        return CUDA_PROJECTOR_SUCCESS;
     }
 }
 
@@ -1012,8 +1344,6 @@ extern "C"
                 g_cuda_phantom.d_xy_mask, g_cuda_phantom.d_xy_mask_offsets, d_sourcePoints, d_detZ, d_detX, d_scales,
                 d_x0, d_y0, d_z0, d_vertical, nrdetcols, nrdetrows, mat_id, 0, d_views);
             err = cudaGetLastError();
-            if (err == cudaSuccess)
-                err = cudaDeviceSynchronize();
         }
 
         if (err == cudaSuccess)
@@ -1022,8 +1352,6 @@ extern "C"
                 d_detZ, d_sourcePoints, g_cuda_phantom.d_voxel_size, d_detX, d_scales, d_x0, d_y0, d_views,
                 nrdetcols, nrdetrows, mat_id, n_pixels, 0, d_paths);
             err = cudaGetLastError();
-            if (err == cudaSuccess)
-                err = cudaDeviceSynchronize();
         }
 
         if (err == cudaSuccess)
@@ -1031,8 +1359,6 @@ extern "C"
             combine_trans_kernel<<<view_blocks, threads>>>(
                 d_paths, g_cuda_phantom.d_mu, MaterialIndex, n_materials, n_energy, n_pixels, d_thisView);
             err = cudaGetLastError();
-            if (err == cudaSuccess)
-                err = cudaDeviceSynchronize();
         }
 
         if (err == cudaSuccess)

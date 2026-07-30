@@ -41,52 +41,86 @@ def C_Projector_Voxelized_CUDA(cfg, viewId, subViewId):
     det_vvecs = np.ascontiguousarray(det.vvecs, dtype=np.float32)
     det_start_indices = np.ascontiguousarray(det.startIndices, dtype=np.int32)
     mod_type_inds = np.ascontiguousarray(det.modTypes.reshape(-1), dtype=np.int32)
+    source_points = np.ascontiguousarray(src.samples[: src.nSamples, :], dtype=np.float32)
+    source_weights = np.ascontiguousarray(src.weights[0, : src.nSamples], dtype=np.float32)
 
     trans = np.zeros((n_pixels, n_energy), dtype=np.float32)
-    matPVS = np.zeros((n_pixels, n_energy), dtype=np.float32)
+    batch_projector = getattr(lib, "voxelized_projector_cuda_batch", None)
 
-    for srcId in range(src.nSamples):
-        theSourcePoint = np.ascontiguousarray(src.samples[srcId, :], dtype=np.float32)
-        pValueSpectrum = np.zeros((n_pixels, n_energy), dtype=np.float32)
+    if batch_projector is not None:
+        status = batch_projector(
+            host["volume_data"],
+            host["volume_offsets"],
+            host["dims"],
+            host["volume_offsets_xyz"],
+            host["voxel_size"],
+            host["mu"],
+            host["xy_mask"],
+            host["xy_mask_offsets"],
+            source_points,
+            source_weights,
+            int(src.nSamples),
+            det_cell_coords,
+            mod_type_inds,
+            det_mod_coords,
+            det_uvecs,
+            det_vvecs,
+            det_start_indices,
+            det_cells_per_mod,
+            n_modules,
+            n_materials,
+            n_energy,
+            n_pixels,
+            int(host["volume_data"].size),
+            trans,
+            device_id,
+        )
+        if status != 0:
+            raise RuntimeError(f"Native CUDA voxelized batch projector failed with status {status}.")
+    else:
+        matPVS = np.zeros((n_pixels, n_energy), dtype=np.float32)
+        for srcId in range(src.nSamples):
+            theSourcePoint = np.ascontiguousarray(src.samples[srcId, :], dtype=np.float32)
+            pValueSpectrum = np.zeros((n_pixels, n_energy), dtype=np.float32)
 
-        for matId in range(n_materials):
-            matPVS[:] = 0
-            MaterialIndex = matId + 1
-            MaterialIndexInMemory = MaterialIndex
+            for matId in range(n_materials):
+                matPVS[:] = 0
+                MaterialIndex = matId + 1
+                MaterialIndexInMemory = MaterialIndex
 
-            status = lib.voxelized_projector_cuda(
-                host["volume_data"],
-                host["volume_offsets"],
-                host["dims"],
-                host["volume_offsets_xyz"],
-                host["voxel_size"],
-                host["mu"],
-                host["xy_mask"],
-                host["xy_mask_offsets"],
-                theSourcePoint,
-                det_cell_coords,
-                mod_type_inds,
-                det_mod_coords,
-                det_uvecs,
-                det_vvecs,
-                det_start_indices,
-                det_cells_per_mod,
-                n_modules,
-                n_materials,
-                n_energy,
-                n_pixels,
-                MaterialIndex,
-                MaterialIndexInMemory,
-                int(host["volume_data"].size),
-                matPVS,
-                device_id,
-            )
-            if status != 0:
-                raise RuntimeError(f"Native CUDA voxelized projector failed with status {status}.")
+                status = lib.voxelized_projector_cuda(
+                    host["volume_data"],
+                    host["volume_offsets"],
+                    host["dims"],
+                    host["volume_offsets_xyz"],
+                    host["voxel_size"],
+                    host["mu"],
+                    host["xy_mask"],
+                    host["xy_mask_offsets"],
+                    theSourcePoint,
+                    det_cell_coords,
+                    mod_type_inds,
+                    det_mod_coords,
+                    det_uvecs,
+                    det_vvecs,
+                    det_start_indices,
+                    det_cells_per_mod,
+                    n_modules,
+                    n_materials,
+                    n_energy,
+                    n_pixels,
+                    MaterialIndex,
+                    MaterialIndexInMemory,
+                    int(host["volume_data"].size),
+                    matPVS,
+                    device_id,
+                )
+                if status != 0:
+                    raise RuntimeError(f"Native CUDA voxelized projector failed with status {status}.")
 
-            pValueSpectrum += matPVS
+                pValueSpectrum += matPVS
 
-        trans += src.weights[0, srcId] * np.exp(-pValueSpectrum)
+            trans += source_weights[srcId] * np.exp(-pValueSpectrum)
 
     cfg.thisSubView *= trans
 
@@ -137,6 +171,38 @@ def _load_cuda_lib(cfg=None):
         c_int,
     ]
     lib.voxelized_projector_cuda.restype = c_int
+
+    try:
+        lib.voxelized_projector_cuda_batch.argtypes = [
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_int64, flags="C_CONTIGUOUS"),
+            ndpointer(c_int, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_ubyte, flags="C_CONTIGUOUS"),
+            ndpointer(c_int64, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            c_int,
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_int, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            ndpointer(c_int, flags="C_CONTIGUOUS"),
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int64,
+            ndpointer(c_float, flags="C_CONTIGUOUS"),
+            c_int,
+        ]
+        lib.voxelized_projector_cuda_batch.restype = c_int
+    except AttributeError:
+        pass
 
     _CUDA_LIB = lib
     _CUDA_LIB_PATH = lib_path

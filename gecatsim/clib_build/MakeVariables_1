@@ -1,0 +1,19 @@
+# Copyright 2024, GE Precision HealthCare. All rights reserved. See https://github.com/xcist/main/tree/master/license
+
+CSOURCES = \
+gemsfilt.c \
+pd3dbpsemi.c \
+DD2Back.c \
+DD2Proj.c \
+DD2WBack.c \
+DD3WBack.c \
+pd2dbpcurved.c \
+pd2dbpflat.c \
+extractsino.c \
+viewshift.c \
+spline.c \
+xybowtie.c \
+DD2ParProj.c \
+analytic_projector.c \
+rndpoi.c \
+nCAT_main.c
